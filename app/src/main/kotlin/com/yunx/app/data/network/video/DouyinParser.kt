@@ -22,6 +22,10 @@ import com.yunx.app.data.download.DownloadPathPolicy
 import com.yunx.app.data.network.HttpClients
 import com.yunx.app.util.DiagnosticLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -103,18 +107,63 @@ object DouyinParser : VideoParser {
     @Volatile
     private var cachedTtwid: String? = null
 
+    /** HTTP 竞速兜底的延迟启动时长：给主路线 WebView 一个优先窗口，避免无谓的重复请求 */
+    private const val HTTP_RACE_DELAY_MS = 6_000L
+
     private data class ResolvedMedia(val url: String, val size: Long, val headers: Map<String, String>)
 
-    override suspend fun parse(link: DetectedVideoLink, cookie: String): VideoParseResult {
-        // ★ 主路线：隐藏 WebView 真跑一遍页面。纯 HTTP 拿不到数据 —— 先要过 byted_acrawler 挑战，
-        //   而真页面里数据又只渲染在 DOM 里（见类注释的「重要现状」）。
-        fetchViaWebView(link)?.let { return buildFromWebView(link, it) }
+    override suspend fun parse(link: DetectedVideoLink, cookie: String): VideoParseResult = coroutineScope {
+        // ★ 主路线：隐藏 WebView 真跑一遍页面（架构定位不变）。纯 HTTP 拿不到数据 —— 先要过
+        //   byted_acrawler 挑战，而真页面里数据又只渲染在 DOM 里（见类注释的「重要现状」）。
+        val webview = async { runCatching { fetchViaWebView(link) } }
 
-        // 回退：老的 HTTP + SSR 路线。2026-10 起基本必然拿不到数据，保留只为抖音万一回退回去。
-        val shareUrl = buildShareUrl(link)
-        val data = fetchWorkData(link, shareUrl, cookie)
-        val mediaHeaders = buildMediaHeaders(shareUrl)
+        // ★ HTTP 竞速兜底：延迟 [HTTP_RACE_DELAY_MS] 启动，给 WebView 优先窗口。
+        //   为什么保留 HTTP：抖音风控分地区/分 IP（2026-10-24 家宽复测，ttwid 注册正常、分享页
+        //   _ROUTER_DATA 内嵌完整数据、play 端点 302 到 CDN —— 整条 HTTP 链路可通），HTTP 命中时
+        //   秒级出结果，而 WebView 实测要 25s+。为什么只是兜底：挑战页**不定时**返回，HTTP 可能
+        //   被挡 —— 被挡时它自然失败（几秒内），结果仍由主路线 WebView 给出，定位不变。
+        val http = async {
+            delay(HTTP_RACE_DELAY_MS)
+            runCatching {
+                val shareUrl = buildShareUrl(link)
+                fetchWorkData(link, shareUrl, cookie) to buildMediaHeaders(shareUrl)
+            }
+        }
 
+        // 先完成且成功者胜：WebView 成功 → 取消 HTTP（主路线优先）；HTTP 先成功 → 直接采用（快）
+        var wv: Result<WebPayload?>? = null
+        var ht: Result<Pair<JSONObject, Map<String, String>>>? = null
+        while (wv == null && ht == null) {
+            val first = select<Pair<String, Any?>> {
+                webview.onAwait { "wv" to it }
+                http.onAwait { "http" to it }
+            }
+            if (first.first == "wv") wv = first.second as Result<WebPayload?> else ht = first.second as Result<Pair<JSONObject, Map<String, String>>>
+        }
+        val webviewPayload = (wv ?: webview.await()).getOrNull()
+        if (webviewPayload != null) {
+            http.cancel()
+            return@coroutineScope buildFromWebView(link, webviewPayload)
+        }
+        // 主路线失败（null / 异常）→ 等 HTTP 兜底结果
+        val httpHit = (ht ?: http.await()).getOrNull()
+        if (httpHit != null) {
+            webview.cancel()
+            return@coroutineScope buildFromWorkData(link, httpHit.first, httpHit.second)
+        }
+
+        // 两条路线都失败：HTTP 的异常更有指向性（errno/风控细分提示），优先抛它
+        throw ht?.exceptionOrNull() as? VideoParseException
+            ?: wv?.exceptionOrNull() as? VideoParseException
+            ?: VideoParseException(VideoParseErrorKind.BLOCKED, "抖音解析失败：两条取数路线均被风控拦截，请稍后重试")
+    }
+
+    /** HTTP 竞速路线的结果拼装：字段提取与原回退路径完全一致 */
+    private suspend fun buildFromWorkData(
+        link: DetectedVideoLink,
+        data: JSONObject,
+        mediaHeaders: Map<String, String>,
+    ): VideoParseResult {
         val title = data.optStringAny("desc")
         val medias = mutableListOf<VideoMedia>()
         var cover = ""
